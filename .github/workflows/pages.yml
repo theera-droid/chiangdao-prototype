@@ -1,0 +1,65 @@
+name: Update availability and deploy GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '3-58/5 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: chiangdao-prototype
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check season for scheduled runs
+        id: season
+        shell: bash
+        run: |
+          if [[ '${{ github.event_name }}' == 'schedule' && "$(date -u +%Y%m%d)" > '20270213' ]]; then
+            echo 'active=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'active=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.season.outputs.active == 'true'
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: chiangdao-prototype/package-lock.json
+      - run: npm ci
+        if: steps.season.outputs.active == 'true'
+      - run: npm test
+        if: steps.season.outputs.active == 'true'
+      - name: Read real availability with last-known fallback
+        if: steps.season.outputs.active == 'true'
+        run: node scripts/export-pages.js
+        env:
+          PAGES_PREVIOUS_URL: https://theera-droid.github.io/chiangdao-prototype/data/availability.json
+      - run: npm run build
+        if: steps.season.outputs.active == 'true'
+        env:
+          VITE_PAGES: 'true'
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.season.outputs.active == 'true'
+        with:
+          path: chiangdao-prototype/dist
+      - name: Deploy
+        if: steps.season.outputs.active == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4

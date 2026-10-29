@@ -3,14 +3,14 @@ import { dirname } from 'node:path';
 import { isVisitDate } from './availability.js';
 
 export const MONTHS = ['2026-11', '2026-12', '2027-01', '2027-02'];
-const TTL = 300000;
+const TTL = 60000;
 export function visitDates(month) {
   if (!MONTHS.includes(month)) return [];
   const [year, m] = month.split('-').map(Number);
   return Array.from({ length: new Date(year, m, 0).getDate() }, (_, i) => `${month}-${String(i + 1).padStart(2, '0')}`).filter(isVisitDate);
 }
 export function createSnapshots({ read, path = null, now = Date.now, pause = ms => new Promise(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.(); }) }) {
-  const records = {}, states = new Map(), queue = [];
+  const records = {}, states = new Map(), queue = [], listeners = new Map();
   let worker = null, closed = false, globalRetryAt = 0;
   const state = month => {
     if (!states.has(month)) states.set(month, { activeUntil: 0, nextRefresh: 0, error: '' });
@@ -51,32 +51,47 @@ export function createSnapshots({ read, path = null, now = Date.now, pause = ms 
     while (queue.length && !closed) {
       const month = queue.shift(), s = state(month);
       if (now() < globalRetryAt) break;
-      s.running = true; s.error = '';
+      s.running = true; s.error = ''; emit(month);
       try {
-        for (const date of visitDates(month)) {
-          if (closed || fresh(date)) continue;
-          try {
-            const row = await read(date);
-            if (closed) break;
-            // Preserve a persisted last good value if the fresh process cannot read this day.
-            records[date] = row.error && !row.day.observedAt && records[date]?.day.observedAt
-              ? { ...records[date], stale: true, error: row.error } : row;
-            if (row.error) s.error = row.error;
-            if (row.blocked) { globalRetryAt = now() + TTL; queue.length = 0; break; }
-          } catch (error) {
-            s.error = error.message;
-            if (records[date]) records[date] = { ...records[date], stale: true, error: error.message };
-            if (error.status === 503) { globalRetryAt = now() + TTL; queue.length = 0; break; }
+        const staged = {}, dates = visitDates(month).filter(date => !fresh(date));
+        for (let index = 0; index < dates.length && !closed; index += 3) {
+          const started = now(), batch = dates.slice(index,index+3);
+          const outcomes = await Promise.allSettled(batch.map(date => read(date)));
+          if (closed) break;
+          let blocked = false;
+          for (let i=0;i<batch.length;i++) {
+            const date=batch[i], outcome=outcomes[i];
+            if (outcome.status === 'fulfilled') {
+              const row=outcome.value;
+              staged[date] = row.error && !row.day.observedAt && records[date]?.day.observedAt
+                ? {...records[date],stale:true,error:row.error} : row;
+              if(row.error) s.error=row.error;
+              if(row.blocked) { blocked=true;globalRetryAt=Math.max(globalRetryAt,Date.parse(row.retryAt)||now()+300000); }
+            } else {
+              s.error=outcome.reason.message;
+              staged[date]=records[date] ? {...records[date],stale:true,error:s.error} : {source:'live',stale:true,error:s.error,day:{date,available:null,capacity:null,status:'unknown',observedAt:null}};
+              if(outcome.reason.status===503) {blocked=true;globalRetryAt=Math.max(globalRetryAt,now()+TTL);}
+            }
           }
-          if (!closed) await pause(1500);
+          if(blocked) { queue.length=0;break; }
+          if(index+3<dates.length && !closed) await pause(Math.max(0,1250-(now()-started)));
+        }
+        if (!closed) {
+          Object.assign(records,staged);
+          if(now()<globalRetryAt) for(const [date,row] of Object.entries(records)) records[date]={...row,stale:true};
         }
         await persist();
-      } finally { s.running = false; s.nextRefresh = now() + TTL; }
+      } finally {
+        s.running = false;
+        const observed = visitDates(month).map(date => Date.parse(records[date]?.day.observedAt)).filter(Number.isFinite);
+        s.nextRefresh = s.error ? now() + TTL : Math.max(now() + 1000, Math.min(...observed) + TTL);
+        emit(month);
+      }
     }
   }
   const timer = setInterval(() => {
-    for (const [month, s] of states) if (s.activeUntil > now()) schedule(month);
-  }, 10000);
+    for (const [month, s] of states) if (s.activeUntil > now() || listeners.get(month)?.size) schedule(month);
+  }, 2000);
   timer.unref?.();
   async function get(month) {
     if (!MONTHS.includes(month)) throw new Error('Invalid month');
@@ -84,9 +99,18 @@ export function createSnapshots({ read, path = null, now = Date.now, pause = ms 
     const s = state(month);
     s.activeUntil = now() + 600000;
     schedule(month);
-    const dates = visitDates(month);
-    const rows = dates.filter(date => records[date]).map(date => ({ ...records[date], stale: !fresh(date) }));
-    return { source: 'live', month, records: rows, loading: Boolean(s.running || queue.includes(month)), loaded: rows.filter(row => row.day.observedAt).length, total: dates.length, error: s.error, nextRefreshAt: s.nextRefresh ? new Date(Math.max(s.nextRefresh, globalRetryAt)).toISOString() : null };
+    return view(month);
   }
-  return { get, warm: month => get(month), settle: async () => { await ready; await worker; }, close: () => { closed = true; clearInterval(timer); queue.length = 0; } };
+  function view(month) {
+    const s = state(month), dates = visitDates(month);
+    const rows = dates.filter(date => records[date]).map(date => ({ ...records[date], stale: !fresh(date) }));
+    return { source: 'live', month, records: rows, loading: Boolean(s.running || queue.includes(month)), loaded: rows.filter(row => row.day.observedAt).length, total: dates.length, error: s.error || (now() < globalRetryAt ? 'ยังเชื่อมต่อต้นทางไม่ได้ กำลังพักก่อนลองใหม่' : ''), nextRefreshAt: s.nextRefresh ? new Date(Math.max(s.nextRefresh, globalRetryAt)).toISOString() : null };
+  }
+  function emit(month) { for (const listener of listeners.get(month) ?? []) listener(view(month)); }
+  function subscribe(month, listener) {
+    if (!listeners.has(month)) listeners.set(month, new Set());
+    listeners.get(month).add(listener);
+    return () => listeners.get(month)?.delete(listener);
+  }
+  return { get, subscribe, warm: month => get(month), settle: async () => { await ready; await worker; }, close: () => { closed = true; clearInterval(timer); queue.length = 0; listeners.clear(); } };
 }

@@ -32,7 +32,7 @@ test('access denial backs off', async () => {
   await assert.rejects(read('2026-11-17')); assert.equal(calls, 1);
 });
 test('API validates dates and exposes only read route', async () => {
-  const app = createApp({ fetchImpl: async url => Response.json(url.includes('/chiangdao/open') ? { data: { q: { open: true } } } : { success: true, data: { date: '2026-11-16', available: 8, capacity: 100 } }) });
+  const app = createApp({ snapshotPath: null, fetchImpl: async url => Response.json(url.includes('/chiangdao/open') ? { data: { q: { open: true } } } : { success: true, data: { date: '2026-11-16', available: 8, capacity: 100 } }) });
   const server = app.listen(0, '127.0.0.1'); await once(server, 'listening');
   const base = `http://127.0.0.1:${server.address().port}`;
   try {

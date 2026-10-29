@@ -9,16 +9,19 @@ test('snapshot returns immediately while one shared background job serves repeat
   let release, calls=0;
   const hold = new Promise(resolve=>release=resolve);
   const store=createSnapshots({read:async date=>{calls++;await hold;return row(date);},pause:async()=>{}});
+  const published=[];
+  const unsubscribe=store.subscribe('2026-11', snapshot=>published.push(snapshot.loaded));
   try {
     const first=await store.get('2026-11');
     assert.equal(first.loaded,0);assert.equal(first.loading,true);
     await store.get('2026-11');await store.get('2026-11');
-    assert.equal(calls,1);
+    assert.equal(calls,3);
     release();await store.settle();
     const ready=await store.get('2026-11');
     assert.equal(ready.loaded,visitDates('2026-11').length);
     assert.equal(ready.loading,false);assert.equal(calls,ready.loaded);
-  } finally { release();store.close(); }
+    assert(published.every(count=>count===0 || count===ready.total), 'month must be published atomically');
+  } finally { unsubscribe();release();store.close(); }
 });
 test('persisted real snapshots survive restart and stay readable on upstream failure', async () => {
   const dir=await mkdtemp(join(tmpdir(),'chiangdao-cache-')),path=join(dir,'cache.json');
@@ -37,5 +40,5 @@ test('persisted real snapshots survive restart and stay readable on upstream fai
 test('upstream restriction stops background collection across months', async () => {
   let calls=0;
   const store=createSnapshots({read:async date=>{calls++;return {...row(date),blocked:true,error:'403'};},pause:async()=>{}});
-  try {await store.get('2026-11');await store.settle();await store.get('2026-12');await store.settle();assert.equal(calls,1);} finally {store.close();}
+  try {await store.get('2026-11');await store.settle();await store.get('2026-12');await store.settle();assert.equal(calls,3);} finally {store.close();}
 });
